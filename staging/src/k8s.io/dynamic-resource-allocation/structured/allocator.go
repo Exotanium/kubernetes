@@ -534,6 +534,10 @@ func lookupAttribute(device *draapi.BasicDevice, deviceID DeviceID, attributeNam
 	return nil
 }
 
+//EXO: claim API spec: https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/V1alpha3DeviceClaim.md
+//EXO: I'm breaking the DRA scheduling and assuming sdg only.
+//EXO TODO: support/put back in regular DRA request handling
+
 // allocateOne iterates over all eligible devices (not in use, match selector,
 // satisfy constraints) for a specific required device. It returns true if
 // everything got allocated, an error if allocation needs to stop.
@@ -542,7 +546,7 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 		// Done! If we were doing scoring, we would compare the current allocation result
 		// against the previous one, keep the best, and continue. Without scoring, we stop
 		// and use the first solution.
-		alloc.logger.V(6).Info("Allocation result found")
+		alloc.logger.V(4).Info("Allocation result found")
 		return true, nil
 	}
 
@@ -556,42 +560,24 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 	// Ready to move on to the next request?
 	requestData := alloc.requestData[requestIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex}]
 	if r.deviceIndex >= requestData.numDevices {
+		// go to next request of this claim
 		return alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex + 1})
 	}
 
 	request := &alloc.claimsToAllocate[r.claimIndex].Spec.Devices.Requests[r.requestIndex]
-	doAllDevices := request.AllocationMode == resourceapi.DeviceAllocationModeAll
-	alloc.logger.V(6).Info("Allocating one device", "currentClaim", r.claimIndex, "totalClaims", len(alloc.claimsToAllocate), "currentRequest", r.requestIndex, "totalRequestsPerClaim", len(claim.Spec.Devices.Requests), "currentDevice", r.deviceIndex, "devicesPerRequest", requestData.numDevices, "allDevices", doAllDevices, "adminAccess", request.AdminAccess)
+	alloc.logger.V(4).Info("request is now: %v", request)
 
-	if doAllDevices {
-		// For "all" devices we already know which ones we need. We
-		// just need to check whether we can use them.
-		deviceWithID := requestData.allDevices[r.deviceIndex]
-		success, _, err := alloc.allocateDevice(r, deviceWithID, true)
-		if err != nil {
-			return false, err
-		}
-		if !success {
-			// The order in which we allocate "all" devices doesn't matter,
-			// so we only try with the one which was up next. If we couldn't
-			// get all of them, then there is no solution and we have to stop.
-			return false, errStop
-		}
-		done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
-		if err != nil {
-			return false, err
-		}
-		if !done {
-			// Backtrack.
-			return false, nil
-		}
-		return done, nil
-	}
-
+	// neededDevices := requestData.numDevices
 	// We need to find suitable devices.
 	for _, pool := range alloc.pools {
 		for _, slice := range pool.Slices {
-			for deviceIndex := range slice.Spec.Devices {
+			//HF: find all unique UUIDs
+
+			//HF: for each UUID
+			//HF:    for each device with that UUID
+			for deviceIndex, device := range slice.Spec.Devices {
+				alloc.logger.V(4).Info("looking into device: %v", device)
+
 				deviceID := DeviceID{Driver: pool.Driver, Pool: pool.Pool, Device: slice.Spec.Devices[deviceIndex].Name}
 
 				// Checking for "in use" is cheap and thus gets done first.
@@ -875,3 +861,123 @@ func containsNodeSelectorRequirement(requirements []v1.NodeSelectorRequirement, 
 	}
 	return false
 }
+
+// func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
+// 	if r.claimIndex >= len(alloc.claimsToAllocate) {
+// 		// Done! If we were doing scoring, we would compare the current allocation result
+// 		// against the previous one, keep the best, and continue. Without scoring, we stop
+// 		// and use the first solution.
+// 		alloc.logger.V(6).Info("Allocation result found")
+// 		return true, nil
+// 	}
+
+// 	claim := alloc.claimsToAllocate[r.claimIndex]
+// 	if r.requestIndex >= len(claim.Spec.Devices.Requests) {
+// 		// Done with the claim, continue with the next one.
+// 		return alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex + 1})
+// 	}
+
+// 	// We already know how many devices per request are needed.
+// 	// Ready to move on to the next request?
+// 	requestData := alloc.requestData[requestIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex}]
+// 	if r.deviceIndex >= requestData.numDevices {
+// 		return alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex + 1})
+// 	}
+
+// 	request := &alloc.claimsToAllocate[r.claimIndex].Spec.Devices.Requests[r.requestIndex]
+// 	doAllDevices := request.AllocationMode == resourceapi.DeviceAllocationModeAll
+// 	alloc.logger.V(6).Info("Allocating one device", "currentClaim", r.claimIndex, "totalClaims", len(alloc.claimsToAllocate), "currentRequest", r.requestIndex, "totalRequestsPerClaim", len(claim.Spec.Devices.Requests), "currentDevice", r.deviceIndex, "devicesPerRequest", requestData.numDevices, "allDevices", doAllDevices, "adminAccess", request.AdminAccess)
+
+// 	if doAllDevices {
+// 		// For "all" devices we already know which ones we need. We
+// 		// just need to check whether we can use them.
+// 		deviceWithID := requestData.allDevices[r.deviceIndex]
+// 		success, _, err := alloc.allocateDevice(r, deviceWithID, true)
+// 		if err != nil {
+// 			return false, err
+// 		}
+// 		if !success {
+// 			// The order in which we allocate "all" devices doesn't matter,
+// 			// so we only try with the one which was up next. If we couldn't
+// 			// get all of them, then there is no solution and we have to stop.
+// 			return false, errStop
+// 		}
+// 		done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
+// 		if err != nil {
+// 			return false, err
+// 		}
+// 		if !done {
+// 			// Backtrack.
+// 			return false, nil
+// 		}
+// 		return done, nil
+// 	}
+
+// 	// We need to find suitable devices.
+// 	for _, pool := range alloc.pools {
+// 		for _, slice := range pool.Slices {
+
+// 			//HF: find all unique UUIDs
+
+// 			//HF: for each UUID
+// 			//HF:    for each device with that UUID
+// 			for deviceIndex := range slice.Spec.Devices {
+// 				deviceID := DeviceID{Driver: pool.Driver, Pool: pool.Pool, Device: slice.Spec.Devices[deviceIndex].Name}
+
+// 				// Checking for "in use" is cheap and thus gets done first.
+// 				if !ptr.Deref(request.AdminAccess, false) && (alloc.allocatedDevices.Has(deviceID) || alloc.allocatingDevices[deviceID]) {
+// 					alloc.logger.V(7).Info("Device in use", "device", deviceID)
+// 					continue
+// 				}
+
+// 				// Next check selectors.
+// 				selectable, err := alloc.isSelectable(requestIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex}, slice, deviceIndex)
+// 				if err != nil {
+// 					return false, err
+// 				}
+// 				if !selectable {
+// 					alloc.logger.V(7).Info("Device not selectable", "device", deviceID)
+// 					continue
+// 				}
+
+// 				// If the pool is not valid, then fail now. It's okay when pools of one driver
+// 				// are invalid if we allocate from some other pool, but it's not safe to
+// 				// allocated from an invalid pool.
+// 				if pool.IsInvalid {
+// 					return false, fmt.Errorf("pool %s is invalid: %s", pool.Pool, pool.InvalidReason)
+// 				}
+
+// 				// Finally treat as allocated and move on to the next device.
+// 				device := deviceWithID{
+// 					id:    deviceID,
+// 					basic: slice.Spec.Devices[deviceIndex].Basic,
+// 					slice: slice,
+// 				}
+// 				allocated, deallocate, err := alloc.allocateDevice(r, device, false)
+// 				if err != nil {
+// 					return false, err
+// 				}
+// 				if !allocated {
+// 					// In use or constraint violated...
+// 					alloc.logger.V(7).Info("Device not usable", "device", deviceID)
+// 					continue
+// 				}
+// 				done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
+// 				if err != nil {
+// 					return false, err
+// 				}
+
+// 				// If we found a solution, then we can stop.
+// 				if done {
+// 					return done, nil
+// 				}
+
+// 				// Otherwise try some other device after rolling back.
+// 				deallocate()
+// 			}
+// 		}
+// 	}
+
+// 	// If we get here without finding a solution, then there is none.
+// 	return false, nil
+// }
