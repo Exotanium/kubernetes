@@ -281,7 +281,7 @@ func (a *Allocator) Allocate(ctx context.Context, node *v1.Node) (finalResult []
 	// We can estimate the size based on what we need to allocate.
 	alloc.allocatingDevices = make(map[DeviceID]bool, numDevicesTotal)
 
-	alloc.logger.V(6).Info("Gathered information about devices", "numAllocated", len(alloc.allocatedDevices), "toBeAllocated", numDevicesTotal)
+	alloc.logger.V(4).Info("Gathered information about devices", "numAllocated", len(alloc.allocatedDevices), "toBeAllocated", numDevicesTotal)
 
 	// In practice, there aren't going to be many different CEL
 	// expressions. Most likely, there is going to be handful of different
@@ -538,6 +538,25 @@ func lookupAttribute(device *draapi.BasicDevice, deviceID DeviceID, attributeNam
 //EXO: I'm breaking the DRA scheduling and assuming sdg only.
 //EXO TODO: support/put back in regular DRA request handling
 
+type DeviceUsage struct {
+	Free          int64
+	Used          int64
+	FreeDeviceIDs []deviceWithID
+}
+
+func GetDeviceUUID(device draapi.Device) (string, bool) {
+	if device.Basic == nil {
+		return "", false
+	}
+
+	uuidAttr, exists := device.Basic.Attributes["uuid"]
+	if !exists || uuidAttr.StringValue == nil {
+		return "", false
+	}
+
+	return *uuidAttr.StringValue, true
+}
+
 // allocateOne iterates over all eligible devices (not in use, match selector,
 // satisfy constraints) for a specific required device. It returns true if
 // everything got allocated, an error if allocation needs to stop.
@@ -546,7 +565,7 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 		// Done! If we were doing scoring, we would compare the current allocation result
 		// against the previous one, keep the best, and continue. Without scoring, we stop
 		// and use the first solution.
-		alloc.logger.V(4).Info("Allocation result found")
+		alloc.logger.V(1).Info("Allocation result found")
 		return true, nil
 	}
 
@@ -556,43 +575,41 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 		return alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex + 1})
 	}
 
-	// We already know how many devices per request are needed.
-	// Ready to move on to the next request?
-	requestData := alloc.requestData[requestIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex}]
-	if r.deviceIndex >= requestData.numDevices {
-		// go to next request of this claim
-		return alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex + 1})
-	}
-
 	request := &alloc.claimsToAllocate[r.claimIndex].Spec.Devices.Requests[r.requestIndex]
-	alloc.logger.V(4).Info("request is now: %v", request)
 
-	// neededDevices := requestData.numDevices
 	// We need to find suitable devices.
+	deviceCounts := make(map[string]*DeviceUsage)
+
 	for _, pool := range alloc.pools {
 		for _, slice := range pool.Slices {
-			//HF: find all unique UUIDs
-
-			//HF: for each UUID
-			//HF:    for each device with that UUID
 			for deviceIndex, device := range slice.Spec.Devices {
-				alloc.logger.V(4).Info("looking into device: %v", device)
+				uid, found := GetDeviceUUID(device)
+				if !found {
+					continue
+				}
+				alloc.logger.V(4).Info("--- looking into device", "uuid", uid)
+				if _, exists := deviceCounts[uid]; !exists {
+					deviceCounts[uid] = &DeviceUsage{}
+				}
 
 				deviceID := DeviceID{Driver: pool.Driver, Pool: pool.Pool, Device: slice.Spec.Devices[deviceIndex].Name}
 
 				// Checking for "in use" is cheap and thus gets done first.
 				if !ptr.Deref(request.AdminAccess, false) && (alloc.allocatedDevices.Has(deviceID) || alloc.allocatingDevices[deviceID]) {
-					alloc.logger.V(7).Info("Device in use", "device", deviceID)
+					alloc.logger.V(7).Info("--- Device in use", "device", deviceID)
+					// add info that part of it is being used
+					deviceCounts[uid].Used++
 					continue
 				}
 
 				// Next check selectors.
 				selectable, err := alloc.isSelectable(requestIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex}, slice, deviceIndex)
-				if err != nil {
-					return false, err
-				}
 				if !selectable {
 					alloc.logger.V(7).Info("Device not selectable", "device", deviceID)
+					continue
+				}
+				if err != nil {
+					alloc.logger.V(7).Info("Device not selectable by error", "device", deviceID)
 					continue
 				}
 
@@ -600,43 +617,108 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 				// are invalid if we allocate from some other pool, but it's not safe to
 				// allocated from an invalid pool.
 				if pool.IsInvalid {
+					alloc.logger.V(5).Info("Pool is invalid", "reason", pool.InvalidReason)
 					return false, fmt.Errorf("pool %s is invalid: %s", pool.Pool, pool.InvalidReason)
 				}
 
-				// Finally treat as allocated and move on to the next device.
+				// final check
 				device := deviceWithID{
 					id:    deviceID,
 					basic: slice.Spec.Devices[deviceIndex].Basic,
 					slice: slice,
 				}
-				allocated, deallocate, err := alloc.allocateDevice(r, device, false)
-				if err != nil {
-					return false, err
-				}
-				if !allocated {
-					// In use or constraint violated...
-					alloc.logger.V(7).Info("Device not usable", "device", deviceID)
-					continue
-				}
-				done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
-				if err != nil {
-					return false, err
-				}
+				allocatable := alloc.deviceAllocatable(r, device)
 
-				// If we found a solution, then we can stop.
-				if done {
-					return done, nil
+				if allocatable {
+					deviceCounts[uid].Free += 1
+					deviceCounts[uid].FreeDeviceIDs = append(deviceCounts[uid].FreeDeviceIDs, device)
+				} else {
+					alloc.logger.V(5).Info("--- Device is not allocatable")
 				}
-
-				// Otherwise try some other device after rolling back.
-				deallocate()
 			}
 		}
+	}
+
+	alloc.logger.V(7).Info("--- Resources scanned", "result", deviceCounts)
+
+	var bestUUID string
+	var minFree int64 = math.MaxInt64
+
+	for uuid, usage := range deviceCounts {
+		// Ensure there are enough free devices for the request
+		if usage.Free >= request.Count && usage.Free < minFree {
+			bestUUID = uuid
+			minFree = usage.Free
+		}
+	}
+
+	if bestUUID == "" {
+		alloc.logger.V(4).Info("--- Not enough resources", "requested", request.Count)
+		return false, nil
+	} else {
+		alloc.logger.V(4).Info("--- Best fit device selected", "gpu uuid", bestUUID, "current freeDevices", minFree)
+	}
+
+	selectedDevices := deviceCounts[bestUUID].FreeDeviceIDs[:request.Count]
+	deallocateStack := []func(){}
+	// mark these resources as in use
+	for _, device := range selectedDevices {
+		allocated, deallocate, err := alloc.allocateDevice(r, device, false)
+		if err != nil {
+			alloc.logger.V(7).Info("--- this error should not occur lol", "device", device)
+			for i := len(deallocateStack) - 1; i >= 0; i-- {
+				deallocateStack[i]()
+			}
+			return false, err
+		}
+		if !allocated {
+			// In use or constraint violated...
+			alloc.logger.V(7).Info("--- shouldnt happen! device not usable", "device", device)
+			for i := len(deallocateStack) - 1; i >= 0; i-- {
+				deallocateStack[i]()
+			}
+			return false, err
+		}
+		deallocateStack = append(deallocateStack, deallocate)
+	}
+
+	//done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
+	done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex + 1})
+	if err != nil {
+		return false, err
+	}
+
+	// If we found a solution, then we can stop.
+	if done {
+		return done, nil
 	}
 
 	// If we get here without finding a solution, then there is none.
 	return false, nil
 }
+
+// // Finally treat as allocated and move on to the next device.
+// allocated, deallocate, err := alloc.allocateDevice(r, device, false)
+// if err != nil {
+// 	return false, err
+// }
+// if !allocated {
+// 	// In use or constraint violated...
+// 	alloc.logger.V(7).Info("Device not usable", "device", deviceID)
+// 	continue
+// }
+// done, err := alloc.allocateOne(deviceIndices{claimIndex: r.claimIndex, requestIndex: r.requestIndex, deviceIndex: r.deviceIndex + 1})
+// if err != nil {
+// 	return false, err
+// }
+
+// // If we found a solution, then we can stop.
+// if done {
+// 	return done, nil
+// }
+
+// // Otherwise try some other device after rolling back.
+// deallocate()
 
 // isSelectable checks whether a device satisfies the request and class selectors.
 func (alloc *allocator) isSelectable(r requestIndices, slice *draapi.ResourceSlice, deviceIndex int) (bool, error) {
@@ -723,6 +805,39 @@ func (alloc *allocator) selectorsMatch(r requestIndices, device *draapi.BasicDev
 
 	// All of them match.
 	return true, nil
+}
+
+func (alloc *allocator) deviceAllocatable(r deviceIndices, device deviceWithID) bool {
+	claim := alloc.claimsToAllocate[r.claimIndex]
+	request := &claim.Spec.Devices.Requests[r.requestIndex]
+	adminAccess := ptr.Deref(request.AdminAccess, false)
+	if !adminAccess && (alloc.allocatedDevices.Has(device.id) || alloc.allocatingDevices[device.id]) {
+		alloc.logger.V(7).Info("--- Device in use", "device", device.id)
+		return false
+	}
+
+	final_added := 0
+	// It's available. Now check constraints.
+	for i, constraint := range alloc.constraints[r.claimIndex] {
+		added := constraint.add(request.Name, device.basic, device.id)
+		if !added {
+			// Roll back for all previous constraints before we return.
+			for e := 0; e < i; e++ {
+				alloc.constraints[r.claimIndex][e].remove(request.Name, device.basic, device.id)
+			}
+			alloc.logger.V(7).Info("--- Constraint check failed", "device", device.id)
+			return false
+		}
+		final_added++
+	}
+
+	// EXO: this might be wrong. Do we need to roll back if we succeed, too?
+	for e := 0; e < final_added; e++ {
+		alloc.constraints[r.claimIndex][e].remove(request.Name, device.basic, device.id)
+	}
+
+	alloc.logger.V(7).Info("--- Device is allocatable!", "device", device.id)
+	return true
 }
 
 // allocateDevice checks device availability and constraints for one

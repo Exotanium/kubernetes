@@ -531,6 +531,7 @@ func (pl *DynamicResources) Filter(ctx context.Context, cs *framework.CycleState
 
 	logger := klog.FromContext(ctx)
 	node := nodeInfo.Node()
+	logger.V(2).Info("--- Exostellar DRA Filter scheduler has been activated ---")
 
 	var unavailableClaims []int
 	for index, claim := range state.claims {
